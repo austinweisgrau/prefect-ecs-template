@@ -1,0 +1,300 @@
+# AWS CloudFormation script used to provision VPC & ECS resources
+# Based on https://github.com/anna-geller/dataflow-ops/blob/main/infrastructure/ecs_cluster_prefect_agent.yml
+# Modified to use an Elastic IP based on https://gist.github.com/jbesw/f9401b4c52a7446ef1bb71ceea8cc3e8
+
+# https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html
+# Larger list of available memory options:
+#         options: ['512', '1024', '2048', '4096', '5120', '6144', '7168', '8192', '9216', '10240',
+#  '11264', '12288', '13312', '14336', '15360', '16384', '17408', '18432', '19456', '20480', ..., '30720']
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  Creates a new AWS VPC and a new ECS Cluster. It then deploys an ECS task definition and ECS service 
+  running the Prefect agent in a subnet created within that VPC.
+  The service can then be used as execution layer for Prefect flow runs
+
+Parameters:
+  cpu:
+    Type: String
+    Description: Allow Dynamic CPU configuration
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+  memory:
+    Type: String
+    Description: Allow Increasing Memory - from 8192 on requires 4096 CPU and increases in 1024 increments
+    Default: 1024
+    AllowedValues: [512, 1024, 2048, 4096, 5120, 6144, 7168, 8192 , 9216, 10240]
+  cluster:
+    Type: String
+    Description: Cluster name
+    Default: prefect2
+  awsaccountid:
+    Type: String
+    Description: AWS Account ID
+  region:
+    Type: String
+    Description: AWS region name
+    Default: us-east-1
+  project:
+    Type: String
+    Description: Project name
+    Default: dataflowops
+  image:
+    Type: String
+    Description: Docker image for the service
+    Default: prefecthq/prefect:2-python3.9
+
+Resources:
+  PrefectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref project
+      RetentionInDays: 7
+
+  ## VPC
+  PrefectVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  ## Subnets
+
+  ## We need a public subnet to access the internet
+  ## We also need a private subnet for the ECS task to run on
+  ## The private subnet will route its internet traffic through a NAT gateway
+  ## The NAT gateway will have an associated Elastic IP address
+  ## All internet traffic on the ECS tasks will appear to generate from the same IP address
+  ## We use 2 subnets each as a best practice for some redundancy across availability areas
+  
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrefectVPC
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+ 
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrefectVPC
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+ 
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrefectVPC
+      AvailabilityZone: us-east-1a
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: false
+ 
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrefectVPC
+      AvailabilityZone: us-east-1b
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: false
+
+  ## Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayToInternet:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PrefectVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  ## Public Routing
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PrefectVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayToInternet
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+ 
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  ## NAT Gateway
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: NatPublicIP
+    Properties: 
+      SubnetId: !Ref PublicSubnet1
+      AllocationId: !GetAtt NatPublicIP.AllocationId
+
+  ## Elastic IP
+  NatPublicIP:
+    Type: AWS::EC2::EIP
+    DependsOn: PrefectVPC
+    Properties:
+      Domain: vpc
+
+  ## Private Routing
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PrefectVPC
+  
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      NatGatewayId: !Ref NatGateway
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+ 
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+ 
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  ## IAM
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${project}_ecs_execution_role"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsFromParameterStoreCloudWatch
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                Resource: "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${project}_ecs_task_role"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PrefectS3Storage
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:RunTask
+                  - logs:GetLogEvents
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: "*"
+
+  ## ECS
+  PrefectFargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref cluster
+
+  PrefectTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref project
+      Cpu: !Ref cpu
+      Memory: !Ref memory
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Ref project
+          Image: !Ref image
+          EntryPoint:
+            - "bash"
+            - "-c"
+          StopTimeout: 120
+          Environment:
+            - Name: PREFECT_LOGGING_LEVEL
+              Value: INFO
+            - Name: AWS_RETRY_MODE
+              Value: adaptive
+            - Name: AWS_MAX_ATTEMPTS
+              Value: 10
+          Command:
+            - !Sub "prefect agent start -q ${project}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref PrefectLogGroup
+              awslogs-stream-prefix: !Ref project
+          Secrets:
+            - Name: PREFECT_API_URL
+              ValueFrom: !Sub "arn:aws:ssm:${region}:${awsaccountid}:parameter/PREFECT_API_URL"
+            - Name: PREFECT_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${region}:${awsaccountid}:parameter/PREFECT_API_KEY"
+      RequiresCompatibilities:
+        - FARGATE
+
+  PrefectECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - PublicRoute
+      - PrivateRoute
+      - PublicSubnet1RouteTableAssociation
+      - PublicSubnet2RouteTableAssociation
+      - PrivateSubnet1RouteTableAssociation
+      - PrivateSubnet2RouteTableAssociation
+      - PrefectFargateCluster
+    Properties:
+      ServiceName: !Ref project
+      Cluster: !Ref PrefectFargateCluster
+      TaskDefinition: !Ref PrefectTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2

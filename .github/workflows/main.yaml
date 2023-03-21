@@ -1,0 +1,168 @@
+name: Deploy to AWS ECR and Prefect Cloud
+
+on:
+  workflow_run:
+    workflows:
+      - Run test suite
+    branches: [main]
+    types:
+      - completed
+
+env:
+  PROJECT: dataflowops
+  S3_BLOCK: prod
+  ECS_BLOCK: prod
+  PREFECT_VERSION: 2.*
+  ECS_CLUSTER: prefect
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  changes:
+    name: Code & dependency changes
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      prefect_scheduling_changed: ${{ steps.filter.outputs.schedules }}
+      code_changed: ${{ steps.filter.outputs.code }}
+      flow_definition_changed: ${{ steps.filter.outputs.flow_definitions }}
+      flow_definition_files: ${{ steps.filter.outputs.flow_definitions_files }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Generate Markdown Summary
+        run: echo "Starting CI/CD for flows and dependencies added/modified with commit $GITHUB_SHA" >> $GITHUB_STEP_SUMMARY
+      - uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          list-files: json
+          filters: |
+            schedules:
+              - modified: 'scheduling.py'
+            code:
+              - added|modified: 'requirements.txt'
+              - added|modified: 'Dockerfile'
+              - added|modified: 'utilities/**'
+              - added|modified: 'blocks/**'
+              - added|modified: 'flows/**'
+            flow_definitions:
+              - added|modified: 'flows/**/*_flow.py'
+      - name: Generate Markdown Summary
+        run: |
+          echo Schedule changed: ${{ steps.filter.outputs.schedules }} >> $GITHUB_STEP_SUMMARY
+          echo Code dependency changes: ${{ steps.filter.outputs.code_files }} >> $GITHUB_STEP_SUMMARY
+          echo flow changes: ${{ steps.filter.outputs.flow_definitions_files }} >> $GITHUB_STEP_SUMMARY
+
+  deploy_docker:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.code_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: "latest"
+        run: |
+          export IMAGE="$ECR_REGISTRY/$PROJECT:$IMAGE_TAG"
+          docker build -t $IMAGE .
+          docker push $IMAGE
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+  deploy_changed_flows:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.flow_definition_changed == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flows: ${{ fromJson(needs.changes.outputs.flow_definition_files) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.10.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10.10
+
+      - name: Python dependencies
+        run: |
+          pip install prefect==$PREFECT_VERSION
+          PIP_NO_BINARY=parsons PARSONS_LIMITED_DEPENDENCIES=true pip install .
+
+      - name: Prefect Cloud login
+        run: |
+          prefect config set PREFECT_API_KEY=${{ secrets.PREFECT_API_KEY }} 
+          prefect config set PREFECT_API_URL=${{ secrets.PREFECT_API_URL }}
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Deploy flows to Prefect
+        id: build
+        run: |
+          FLOW_NAME=$(basename ${{ matrix.flows }} .py | sed s/_flow//g)
+          prefect deployment build ${{ matrix.flows }}:$FLOW_NAME -q $PROJECT -v $GITHUB_SHA -a -n $FLOW_NAME -o $FLOW_NAME.yaml -ib ecs-task/$ECS_BLOCK
+          echo "flow_manifest=$FLOW_NAME.yaml" >> $GITHUB_OUTPUT
+
+      - name: Upload YAML deployment manifest as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: Deployment YAML manifests
+          path: ${{ steps.build.outputs.flow_manifest }}
+
+  update_schedules:
+    # We want all the potentially new deployments to be deployed first
+    needs: [changes, deploy_changed_flows]
+    # We add always() in case the deploy step didn't run
+    if: ${{ always() && needs.changes.outputs.prefect_scheduling_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.10.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10.10
+
+      - name: Python dependencies
+        run: |
+          pip install prefect==$PREFECT_VERSION
+          PIP_NO_BINARY=parsons PARSONS_LIMITED_DEPENDENCIES=true pip install .
+
+      - name: Prefect Cloud login
+        run: |
+          prefect config set PREFECT_API_KEY=${{ secrets.PREFECT_API_KEY }} 
+          prefect config set PREFECT_API_URL=${{ secrets.PREFECT_API_URL }}
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1-node16
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: 'no'
+
+      - name: Update schedules
+        run: |
+          python scheduling.py

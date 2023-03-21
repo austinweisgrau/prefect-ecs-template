@@ -1,0 +1,5 @@
+pytest==7.2.1
+pre-commit==3.0.4
+pytest-asyncio==0.20.3
+pytest-mock==3.10.0
+python-dotenv==0.21.1

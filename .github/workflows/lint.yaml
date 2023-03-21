@@ -1,0 +1,14 @@
+name: Lint with isort and black
+
+on: [push]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: isort/isort-action@v1.0.0
+        with:
+            configuration: "--profile black --filter-files --check-only"
+            requirementsFiles: "requirements.txt requirements-dev.txt"
+      - uses: psf/black@stable
