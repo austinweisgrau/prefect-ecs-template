@@ -1,6 +1,7 @@
 import logging
 
-import prefect
+from prefect import get_run_logger
+from prefect.exceptions import MissingContextError
 
 # Configure wfp-prefect logger
 # Note that this logger is only used in development
@@ -15,7 +16,7 @@ def get_logger() -> logging.Logger:
     outside of a flow context. See
     https://github.com/PrefectHQ/prefect/issues/8568"""
     try:
-        result = prefect.get_run_logger()
-    except prefect.exceptions.MissingContextError:
-        result = logging.getLogger("wfp-prefect")
+        result = get_run_logger()
+    except MissingContextError:
+        result = logging.getLogger("prefect-development")
     return result
