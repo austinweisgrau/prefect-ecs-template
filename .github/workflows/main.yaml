@@ -1,12 +1,9 @@
 name: Deploy to AWS ECR and Prefect Cloud
 
 on:
-  workflow_run:
-    workflows:
-      - Run test suite
-    branches: [main]
-    types:
-      - completed
+  push:
+    branches:
+      - main
 
 env:
   PROJECT: dataflowops
@@ -17,9 +14,30 @@ env:
   AWS_REGION: 'us-east-1'
 
 jobs:
+  run_tests:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          PIP_NO_BINARY=parsons PARSONS_LIMITED_DEPENDENCIES=true pip install .
+          pip install -r requirements-dev.txt
+
+      - name: Test with pytest
+        run: |
+          python -m pytest
+          
   changes:
+    needs: [run_tests]
     name: Code & dependency changes
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     outputs:
       prefect_scheduling_changed: ${{ steps.filter.outputs.schedules }}
